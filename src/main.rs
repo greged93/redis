@@ -1,5 +1,5 @@
 use eyre::Result;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 
 fn main() -> Result<()> {
@@ -8,7 +8,11 @@ fn main() -> Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                stream.write_all(b"+PONG\r\n")?;
+                let mut buffer = [0; 512];
+                while let Ok(s) = stream.read(&mut buffer) {
+                    println!("Read {s} bytes");
+                    stream.write_all(b"+PONG\r\n")?;
+                }
             }
             Err(e) => {
                 println!("error: {}", e);
