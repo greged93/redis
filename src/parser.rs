@@ -1,12 +1,23 @@
-use crate::commands::RedisCommands;
 use miette::{miette, LabeledSpan};
 
 /// The output value from the parser
 #[derive(PartialEq, Debug, Clone)]
-pub enum ParserOutput {
+pub enum Value {
     String(String),
     Integer(i32),
-    Command(RedisCommands),
+    Array(Vec<Value>),
+}
+
+impl From<String> for Value {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
+impl From<i32> for Value {
+    fn from(value: i32) -> Self {
+        Self::Integer(value)
+    }
 }
 
 pub struct RedisParser<'a> {
@@ -22,7 +33,25 @@ impl<'a> RedisParser<'a> {
         }
     }
 
-    /// Parses the input as a Redis encoded int.
+    /// Parse the input as a Redis encoded [`Value`].
+    fn parse_value(&mut self) -> miette::Result<Value> {
+        match self.cursor.first().ok_or_else(|| miette!("empty input"))? {
+            // Integer
+            b':' => self.parse_int().map(Into::into),
+            // String
+            b'$' => self.parse_string().map(Into::into),
+            _ => Err(miette!(
+                labels = vec![LabeledSpan::at_offset(
+                    self.full.len() - self.cursor.len(),
+                    "here"
+                )],
+                "failed to parse input as value",
+            )
+            .with_source_code(self.full.to_vec())),
+        }
+    }
+
+    /// Parses the input as a Redis encoded integer.
     /// Returns the parsed integer and moves the cursor.
     fn parse_int(&mut self) -> miette::Result<i32> {
         let input = self.cursor;
@@ -61,41 +90,7 @@ impl<'a> RedisParser<'a> {
     }
 
     /// Parses the input as a Redis encoded string.
-    /// Returns the parsed string and moves the cursor.
-    fn parse_string(&mut self) -> miette::Result<String> {
-        let input = self.cursor;
-
-        // Get the end of the length defining bytes
-        let end_length = input
-            .iter()
-            .position(|b| b == &b'\n')
-            .ok_or_else(|| miette!("failed to find first \\n terminator"))?;
-        let end_string = input
-            .get(end_length + 1..)
-            .and_then(|bytes| bytes.iter().position(|b| b == &b'\r'))
-            .ok_or_else(|| miette!("failed to find second \\n terminator"))?;
-
-        // Extract the string
-        let s = input
-            .get(end_length + 1..end_length + 1 + end_string)
-            .and_then(|s| String::from_utf8(s.to_vec()).ok())
-            .ok_or_else(|| {
-                miette!(
-                    labels = vec![LabeledSpan::at_offset(
-                        self.full.len() - self.cursor.len() - end_length - 1,
-                        "here"
-                    )],
-                    "failed to parse to bytes to utf8",
-                )
-                .with_source_code(self.full.to_vec())
-            })?;
-
-        self.cursor = &self.cursor[..end_length + 1 + end_string];
-        Ok(s)
-    }
-
-    /// Parses the input as a Redis encoded string.
-    /// Returns the parsed string and moves the cursor.
+    /// Returns the parsed String and moves the cursor.
     fn parse_string(&mut self) -> miette::Result<String> {
         let input = self.cursor;
 
@@ -130,18 +125,35 @@ impl<'a> RedisParser<'a> {
 }
 
 impl<'a> Iterator for RedisParser<'a> {
-    type Item = miette::Result<ParserOutput>;
+    type Item = miette::Result<Value>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let bytes = self.cursor;
         match bytes.first()? {
-            // Integer
-            b':' => Some(self.parse_int().map(ParserOutput::Integer)),
-            // String
-            b'$' => Some(self.parse_string().map(ParserOutput::String)),
             // Array
-            b'*' => None,
-            _ => Some(Err(miette!("incorrect input"))),
+            // TODO: move this to parse_array.
+            // TODO: remove parse_value and just use parse_value, parse_string and parse_array here.
+            b'*' => {
+                let end_length = bytes.iter().position(|b| b == &b'\r')?;
+                let length = bytes
+                    .get(1..end_length)
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .and_then(|s| s.parse::<usize>().ok())?;
+
+                // Advance cursor to the start of the array
+                self.cursor = &self.cursor[..end_length + 2];
+
+                let mut output = Vec::with_capacity(length);
+                for _ in 0..length {
+                    let value = self.parse_value();
+                    if value.is_err() {
+                        return Some(value);
+                    }
+                    output.push(value.expect("not error"));
+                }
+                Some(Ok(Value::Array(output)))
+            }
+            _ => Some(self.parse_value()),
         }
     }
 }
@@ -161,7 +173,7 @@ mod tests {
         // Then
         let parsed = parser.next().unwrap()?;
 
-        assert_eq!(parsed, ParserOutput::Integer(100));
+        assert_eq!(parsed, Value::Integer(100));
         Ok(())
     }
 
@@ -176,7 +188,7 @@ mod tests {
         // Then
         let parsed = parser.next().unwrap()?;
 
-        assert_eq!(parsed, ParserOutput::Integer(-100));
+        assert_eq!(parsed, Value::Integer(-100));
         Ok(())
     }
 
@@ -191,7 +203,7 @@ mod tests {
         // Then
         let parsed = parser.next().unwrap()?;
 
-        assert_eq!(parsed, ParserOutput::String(String::from("")));
+        assert_eq!(parsed, Value::String(String::from("")));
         Ok(())
     }
 
@@ -206,7 +218,43 @@ mod tests {
         // Then
         let parsed = parser.next().unwrap()?;
 
-        assert_eq!(parsed, ParserOutput::String(String::from("hello")));
+        assert_eq!(parsed, Value::String(String::from("hello")));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_empty_array() -> miette::Result<()> {
+        // Given
+        let input = b"*0\r\n";
+
+        // When
+        let mut parser = RedisParser::new(&input[..]);
+
+        // Then
+        let parsed = parser.next().unwrap()?;
+
+        assert_eq!(parsed, Value::Array(Vec::new()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_array() -> miette::Result<()> {
+        // Given
+        let input = b"*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n";
+
+        // When
+        let mut parser = RedisParser::new(&input[..]);
+
+        // Then
+        let parsed = parser.next().unwrap()?;
+
+        assert_eq!(
+            parsed,
+            Value::Array(vec![
+                Value::String("hello".into()),
+                Value::String("world".into())
+            ])
+        );
         Ok(())
     }
 }
