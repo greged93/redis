@@ -1,10 +1,12 @@
-use eyre::Result;
+use miette::{miette, Result};
+use redis_starter_rust::commands::RedisCommands;
+use redis_starter_rust::parser::RedisParser;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:6379")?;
+    let listener = TcpListener::bind("127.0.0.1:6379").map_err(|e| miette!(e))?;
 
     let mut handles = Vec::new();
     for stream in listener.incoming() {
@@ -21,18 +23,27 @@ async fn main() -> Result<()> {
 
     // Join all the handles to be sure we answer to all incoming requests
     for t in handles {
-        t.await??
+        t.await.map_err(|e| miette!(e))??
     }
 
     Ok(())
 }
 
-/// Handle a TCP stream by writing PONG to it for every input it reads from it.
+/// Handle a TCP stream connection.
 fn handle_connection(mut stream: TcpStream) -> Result<()> {
     let mut buffer = [0; 512];
     while let Ok(s) = stream.read(&mut buffer) {
         println!("Read {s} bytes");
-        stream.write_all(b"+PONG\r\n")?;
+        let mut parser = RedisParser::new(&buffer[..s]);
+        let command: RedisCommands = parser
+            .next()
+            .ok_or_else(|| miette!("empty input"))??
+            .try_into()?;
+        match command {
+            RedisCommands::Ping => stream.write_all(b"+PONG\r\n"),
+            RedisCommands::Echo(x) => stream.write_all(x.as_bytes()),
+        }
+        .map_err(|e| miette!(e))?
     }
 
     Ok(())
