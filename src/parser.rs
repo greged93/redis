@@ -9,6 +9,44 @@ pub enum Value {
     Error(String),
 }
 
+impl Value {
+    /// Encode the value in the Redis protocol.
+    pub fn encode(&self) -> miette::Result<String> {
+        match self {
+            Value::String(x) => Ok(format!("${}\r\n{}\r\n", x.len(), x)),
+            x => Err(miette!("unhandled variant {x:?}")),
+        }
+    }
+
+    /// Returns the value as a string or None if the value isn't a string.
+    pub fn to_string(&self) -> Option<String> {
+        match self {
+            Self::String(x) | Self::Error(x) => Some(x.clone()),
+            _ => None,
+        }
+    }
+
+    /// Returns true if the value is a string.
+    pub fn is_string(&self) -> bool {
+        matches!(self, Value::String(_))
+    }
+
+    /// Returns true if the value is an integer.
+    pub fn is_int(&self) -> bool {
+        matches!(self, Value::Integer(_))
+    }
+
+    /// Returns true if the value is an array.
+    pub fn is_array(&self) -> bool {
+        matches!(self, Value::Array(_))
+    }
+
+    /// Returns true if the value is an error.
+    pub fn is_error(&self) -> bool {
+        matches!(self, Value::Error(_))
+    }
+}
+
 impl From<i32> for Value {
     fn from(value: i32) -> Self {
         Self::Integer(value)
@@ -105,7 +143,7 @@ impl<'a> RedisParser<'a> {
         let end_length = input
             .iter()
             .position(|b| b == &start_char)
-            .ok_or_else(|| miette!("failed to find first \\n terminator"))?;
+            .ok_or_else(|| miette!("failed to find start char {start_char}"))?;
         let end_string = input
             .get(end_length + 1..)
             .and_then(|bytes| bytes.iter().position(|b| b == &b'\r'))
